@@ -22,7 +22,7 @@ original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and
 names = {"start", "stop", "_message_key", "_prune_seen", "_remember_context", "_enqueue_batch",
          "_verify_disk", "_persist_locked", "_async_save_state", "_accept_batch",
          "_mark_running", "_finish_entry", "_run_normal", "_fast_done", "_dispatch_pending",
-         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast", "_menu_agent", "_run_menu", "_context_agent"}
+         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast", "_menu_agent", "_run_menu", "_context_agent", "_semantic_agent"}
 methods = [node for node in original.body if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name in names]
 cls = ast.ClassDef(name="Dispatch", bases=[], keywords=[], body=methods, decorator_list=[])
 module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
@@ -117,6 +117,7 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
                 d._dispatch_event.set()
 
         d._context_agent = lambda: None
+        d._semantic_agent = lambda message: None
         d._menu_agent = lambda message: None
         d._run_menu = menu
         d._handle_message = normal
@@ -314,6 +315,49 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("a",d._context_fast_tasks)
         gate.set()
         await self.until(lambda:self.replies==["help","fastwater"])
+
+    async def test_semantic_lane_preserves_native_priority_and_local_order(self):
+        d=self.d
+        d._context_agent=lambda:(object(),"nexora")
+        d._semantic_agent=lambda m:True if m["text"] in {"fastlux","阳台光照度"} else None
+        await self.enqueue(msg(1,"slow"),msg(2,"fastlux"),msg(3,"阳台光照度"))
+        await self.until(lambda:len(self.replies)==2)
+        self.assertEqual(self.replies,["fastlux","阳台光照度"])
+        self.assertEqual(self.started,["slow"])
+        persisted=[entry for snapshot in d._store.writes for entry in snapshot.get("pending",[])]
+        self.assertTrue(any(e["msg"]["text"]=="fastlux" and e.get("read_only") and not e.get("semantic_only") for e in persisted))
+        self.assertTrue(any(e["msg"]["text"]=="阳台光照度" and e.get("semantic_only") for e in persisted))
+        self.release.set()
+        await self.until(lambda:not d._pending)
+
+    async def test_semantic_worker_uses_local_only_protocol(self):
+        from unittest.mock import AsyncMock, patch
+        d=self.d
+        d._tracker=None
+        d._base_url,d._token="test","test"
+        d._hass.config=SimpleNamespace(language="zh-CN")
+        processor=AsyncMock(return_value="39勒克斯")
+        agent=SimpleNamespace(semantic_protocol_version=1,
+                              is_semantic_message=lambda text:text=="阳台光照度",
+                              async_process_semantic=processor)
+        d._context_agent=lambda:(agent,"nexora")
+        d._semantic_agent=lambda m:Dispatch._semantic_agent(d,m)
+        sent=AsyncMock()
+        with patch.dict(ns,{"conversation":SimpleNamespace(ConversationInput=lambda **kw:SimpleNamespace(**kw)),
+                            "Context":lambda:None,"extract_speech_any":lambda r:r,
+                            "async_send_weixin_text":sent,"_MENU_TIMEOUT":10}):
+            entry={"state":"running","menu_only":True,"semantic_only":True,"msg":msg(1,"阳台光照度")}
+            d._pending.append(entry)
+            await Dispatch._run_menu(d,"a",entry)
+            self.assertEqual(processor.await_args.args[0].conversation_id,"wechat:test:a")
+            self.assertEqual(sent.await_args.kwargs["text"],"39勒克斯")
+            agent.semantic_protocol_version=2
+            entry={"state":"running","menu_only":True,"semantic_only":True,"msg":msg(2,"阳台光照度")}
+            d._pending.append(entry)
+            await Dispatch._run_menu(d,"a",entry)
+            self.assertIn("配置已变更",sent.await_args.kwargs["text"])
+            processor.assert_awaited_once()
+        self.assertEqual(self.started,[])
 
     async def test_other_sender_not_blocked(self):
         await self.enqueue(msg(1, "slow"), msg(2, "normalB", "b"))
