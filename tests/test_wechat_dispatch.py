@@ -22,7 +22,7 @@ original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and
 names = {"start", "stop", "_message_key", "_prune_seen", "_remember_context", "_enqueue_batch",
          "_verify_disk", "_persist_locked", "_async_save_state", "_accept_batch",
          "_mark_running", "_finish_entry", "_run_normal", "_fast_done", "_dispatch_pending",
-         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast", "_menu_agent", "_run_menu", "_context_agent", "_semantic_agent"}
+         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast", "_menu_agent", "_run_menu", "_context_agent", "_semantic_agent", "_guard_agent"}
 methods = [node for node in original.body if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name in names]
 cls = ast.ClassDef(name="Dispatch", bases=[], keywords=[], body=methods, decorator_list=[])
 module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
@@ -118,6 +118,7 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
 
         d._context_agent = lambda: None
         d._semantic_agent = lambda message: None
+        d._guard_agent = lambda message: None
         d._menu_agent = lambda message: None
         d._run_menu = menu
         d._handle_message = normal
@@ -356,6 +357,48 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
             d._pending.append(entry)
             await Dispatch._run_menu(d,"a",entry)
             self.assertIn("配置已变更",sent.await_args.kwargs["text"])
+            processor.assert_awaited_once()
+        self.assertEqual(self.started,[])
+
+    async def test_guarded_household_turn_bypasses_busy_ai_after_native_priority(self):
+        d=self.d
+        d._context_agent=lambda:(object(),"nexora")
+        d._guard_agent=lambda m:True if m["text"] in {"fastlux","阳台传感器坏了吗"} else None
+        await self.enqueue(msg(1,"slow"),msg(2,"fastlux"),msg(3,"阳台传感器坏了吗"))
+        await self.until(lambda:len(self.replies)==2)
+        self.assertEqual(self.replies,["fastlux","阳台传感器坏了吗"])
+        self.assertEqual(self.started,["slow"])
+        persisted=[e for snapshot in d._store.writes for e in snapshot.get("pending",[])]
+        self.assertTrue(any(e["msg"]["text"]=="fastlux" and e.get("read_only") for e in persisted))
+        self.assertTrue(any(e["msg"]["text"]=="阳台传感器坏了吗" and e.get("guarded_only") for e in persisted))
+        self.release.set()
+        await self.until(lambda:not d._pending)
+
+    async def test_guard_worker_never_falls_back_after_protocol_loss(self):
+        from unittest.mock import AsyncMock, patch
+        d=self.d
+        d._tracker=None
+        d._base_url,d._token="test","test"
+        d._hass.config=SimpleNamespace(language="zh-CN")
+        processor=AsyncMock(return_value="无法确认实时状态")
+        agent=SimpleNamespace(guard_protocol_version=1,
+                              is_guarded_message=lambda text:True,
+                              async_process_guarded=processor)
+        d._context_agent=lambda:(agent,"nexora")
+        d._guard_agent=lambda m:Dispatch._guard_agent(d,m)
+        sent=AsyncMock()
+        with patch.dict(ns,{"conversation":SimpleNamespace(ConversationInput=lambda **kw:SimpleNamespace(**kw)),
+                            "Context":lambda:None,"extract_speech_any":lambda r:r,
+                            "async_send_weixin_text":sent,"_MENU_TIMEOUT":10}):
+            for i in (1,2):
+                entry={"state":"running","menu_only":True,"guarded_only":True,"msg":msg(i,"阳台传感器坏了吗")}
+                d._pending.append(entry)
+                await Dispatch._run_menu(d,"a",entry)
+                if i==1:
+                    self.assertEqual(sent.await_args.kwargs["text"],"无法确认实时状态")
+                    agent.guard_protocol_version=2
+                else:
+                    self.assertIn("配置已变更",sent.await_args.kwargs["text"])
             processor.assert_awaited_once()
         self.assertEqual(self.started,[])
 

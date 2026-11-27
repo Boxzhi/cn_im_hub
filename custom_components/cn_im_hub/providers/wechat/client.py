@@ -285,6 +285,8 @@ class WeixinClient:
                     recovered["menu_only"] = True
                     if entry.get("semantic_only") is True:
                         recovered["semantic_only"] = True
+                    elif entry.get("guarded_only") is True:
+                        recovered["guarded_only"] = True
                 elif entry.get("read_only") is True:
                     recovered["read_only"] = True
                     if entry.get("contextual") is True:
@@ -939,7 +941,9 @@ class WeixinClient:
             menu_only = self._menu_agent(message) is not None
             semantic_only = (not menu_only and query_key is not None and query_key not in eligible
                              and self._semantic_agent(message) is not None)
-            menu_only = menu_only or semantic_only
+            guarded_only = (not menu_only and not semantic_only and query_key is not None
+                            and query_key not in eligible and self._guard_agent(message) is not None)
+            menu_only = menu_only or semantic_only or guarded_only
             contextual = query_key is not None and self._context_agent() is not None
             if not menu_only and not contextual and query_key is not None and query_key in open_queries:
                 _LOGGER.debug("Weixin pending read-only query coalesced")
@@ -949,6 +953,8 @@ class WeixinClient:
                 entry["menu_only"] = True
                 if semantic_only:
                     entry["semantic_only"] = True
+                elif guarded_only:
+                    entry["guarded_only"] = True
             elif query_key is not None and query_key in eligible:
                 entry["read_only"] = True
                 if contextual:
@@ -1230,6 +1236,25 @@ class WeixinClient:
             _LOGGER.debug("Weixin semantic protocol unavailable", exc_info=True)
         return None
 
+    def _guard_agent(self, message: dict[str, Any]):
+        """Opt-in household guard; no effect on other configured agents."""
+        key=self._query_text_key(message)
+        if key is None:
+            return None
+        try:
+            selected=self._context_agent()
+            if selected is None:
+                return None
+            agent,aid=selected
+            if (getattr(agent,"guard_protocol_version",None)==1
+                    and callable(getattr(agent,"is_guarded_message",None))
+                    and callable(getattr(agent,"async_process_guarded",None))
+                    and agent.is_guarded_message(key[1]) is True):
+                return agent,aid,key[1]
+        except Exception:
+            _LOGGER.debug("Weixin household guard protocol unavailable",exc_info=True)
+        return None
+
     async def _run_menu(self, sender: str, entry: dict[str, Any]) -> None:
         """Ordered stateful menu worker; never retry through the ordinary agent."""
         started = time.monotonic()
@@ -1245,7 +1270,9 @@ class WeixinClient:
                 )
             try:
                 semantic_only = entry.get("semantic_only") is True
-                selected = (self._semantic_agent(entry["msg"]) if semantic_only
+                guarded_only = entry.get("guarded_only") is True
+                selected = (self._guard_agent(entry["msg"]) if guarded_only else
+                            self._semantic_agent(entry["msg"]) if semantic_only
                             else self._menu_agent(entry["msg"]))
                 if selected is None:
                     reply = "菜单配置已变更，请重新发送 help。"
@@ -1258,7 +1285,8 @@ class WeixinClient:
                         language=self._hass.config.language, agent_id=aid,
                     )
                     result = await asyncio.wait_for(
-                        (agent.async_process_semantic(user_input) if semantic_only
+                        (agent.async_process_guarded(user_input) if guarded_only else
+                         agent.async_process_semantic(user_input) if semantic_only
                          else agent.async_process_menu(user_input)), timeout=_MENU_TIMEOUT
                     )
                     reply = extract_speech_any(result) or "菜单未返回有效回复，请发送 help。"
@@ -1313,6 +1341,7 @@ class WeixinClient:
                         entry["menu_only"] = True
                         if await self._mark_running(entry):
                             _LOGGER.debug("Weixin dispatch route=%s pending=%d",
+                                          "local_guard" if entry.get("guarded_only") else
                                           "local_semantic" if entry.get("semantic_only") else "local_menu",
                                           len(self._pending))
                             self._menu_tasks[sender] = asyncio.create_task(self._run_menu(sender, entry))
