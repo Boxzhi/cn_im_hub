@@ -241,6 +241,7 @@ class WeixinClient:
         self._normal_tasks: dict[str, asyncio.Task[None]] = {}
         self._fast_tasks: set[asyncio.Task[None]] = set()
         self._menu_tasks: dict[str, asyncio.Task[None]] = {}
+        self._context_fast_tasks: dict[str, asyncio.Task[None]] = {}
         self._pause_until = 0.0
         self._tracker = None
         self._typing_tickets: dict[str, tuple[str, float]] = {}
@@ -284,6 +285,8 @@ class WeixinClient:
                     recovered["menu_only"] = True
                 elif entry.get("read_only") is True:
                     recovered["read_only"] = True
+                    if entry.get("contextual") is True:
+                        recovered["contextual"] = True
                 self._pending.append(recovered)
                 # Stored context_tokens already contains the newest token.
                 # Do not overwrite it with an older queued message.
@@ -313,6 +316,7 @@ class WeixinClient:
         self._normal_tasks.clear()
         self._fast_tasks.clear()
         self._menu_tasks.clear()
+        self._context_fast_tasks.clear()
         _LOGGER.debug("Weixin dispatcher stopped active_tasks=0")
         self._status = "disconnected"
         await self._notify_stop()
@@ -881,7 +885,7 @@ class WeixinClient:
     def _open_query_keys(self) -> set[tuple[str, str]]:
         keys = set()
         for entry in self._pending:
-            if entry.get("read_only") is True and not entry.get("coalesce_closed"):
+            if entry.get("read_only") is True and not entry.get("contextual") and not entry.get("coalesce_closed"):
                 key = self._query_text_key(entry["msg"])
                 if key is not None:
                     keys.add(key)
@@ -931,7 +935,8 @@ class WeixinClient:
                 pending_keys.add(key)
             query_key = self._query_text_key(message)
             menu_only = self._menu_agent(message) is not None
-            if not menu_only and query_key is not None and query_key in open_queries:
+            contextual = query_key is not None and self._context_agent() is not None
+            if not menu_only and not contextual and query_key is not None and query_key in open_queries:
                 _LOGGER.debug("Weixin pending read-only query coalesced")
                 continue
             entry = {"state": "queued", "msg": message}
@@ -939,7 +944,11 @@ class WeixinClient:
                 entry["menu_only"] = True
             elif query_key is not None and query_key in eligible:
                 entry["read_only"] = True
-                open_queries.add(query_key)
+                if contextual:
+                    # Context-bearing queries are stateful turns, not coalescible work.
+                    entry["contextual"] = True
+                else:
+                    open_queries.add(query_key)
             self._pending.append(entry)
         self._prune_seen()
 
@@ -1085,15 +1094,43 @@ class WeixinClient:
                         target_type="user_id", display_name=sender,
                     ), timeout=_FAST_SEND_TIMEOUT,
                 )
+            selected = self._context_agent() if entry.get("contextual") is True else None
+            generation = None
+            if selected is not None:
+                try:
+                    generation = selected[0].begin_fast_context(f"wechat:{self._account_id}:{sender}")
+                except Exception:
+                    _LOGGER.debug("Weixin fast context reservation failed", exc_info=True)
             try:
                 if query is None:
                     # A persisted read-only request may outlive an intent
                     # reload. Never fall back to a tool-enabled agent here.
                     reply = "本地查询配置已变更，请重新发送。"
                 else:
-                    reply = await asyncio.wait_for(
-                        execute_fast_query(self._hass, query), timeout=_QUERY_TIMEOUT
-                    )
+                    if entry.get("contextual") is True:
+                        callback = None
+                        if selected is not None and generation is not None:
+                            agent, aid = selected
+                            cid = f"wechat:{self._account_id}:{sender}"
+                            def callback():
+                                try:
+                                    # A reloaded/replaced agent cannot inherit this turn.
+                                    current = self._context_agent()
+                                    if current is not None and current[0] is agent and current[1] == aid:
+                                        agent.finish_fast_context(
+                                            cid, generation, query.intent_type,
+                                            {k: v["value"] for k, v in query.slots.items()},
+                                        )
+                                except Exception:
+                                    _LOGGER.debug("Weixin fast context capture failed", exc_info=True)
+                        reply = await asyncio.wait_for(
+                            execute_fast_query(self._hass, query, on_success=callback),
+                            timeout=_QUERY_TIMEOUT,
+                        )
+                    else:
+                        reply = await asyncio.wait_for(
+                            execute_fast_query(self._hass, query), timeout=_QUERY_TIMEOUT
+                        )
             except Exception:
                 _LOGGER.exception("Weixin local fast query failed")
                 reply = "本地查询暂时失败，请稍后重试。"
@@ -1120,9 +1157,30 @@ class WeixinClient:
 
     def _fast_done(self, task: asyncio.Task[None]) -> None:
         self._fast_tasks.discard(task)
+        for sender, active in list(self._context_fast_tasks.items()):
+            if active is task:
+                self._context_fast_tasks.pop(sender, None)
         if not task.cancelled() and task.exception() is not None:
             _LOGGER.error("Weixin fast worker failed: %s", type(task.exception()).__name__)
         self._dispatch_event.set()
+
+    def _context_agent(self):
+        """Optional versioned context capture for the configured local agent."""
+        try:
+            aid = _normalize_agent_id_for_runtime(
+                self._hass, str(self._conversation_agent_id or "").strip()
+            )
+            if not aid:
+                return None
+            agent = conversation.async_get_agent(self._hass, aid)
+            if (getattr(agent, "context_protocol_version", None) == 1
+                    and getattr(agent, "menu_protocol_version", None) == 1
+                    and callable(getattr(agent, "begin_fast_context", None))
+                    and callable(getattr(agent, "finish_fast_context", None))):
+                return agent, aid
+        except Exception:
+            _LOGGER.debug("Weixin context protocol unavailable", exc_info=True)
+        return None
 
     def _menu_agent(self, message: dict[str, Any]):
         """Opt in only when the selected agent advertises the local menu protocol."""
@@ -1203,6 +1261,7 @@ class WeixinClient:
             self._dispatch_event.clear()
             try:
                 blocked_senders: set[str] = set()
+                local_blocked: set[str] = set()
                 for entry in list(self._pending):
                     if self._stopping:
                         return
@@ -1216,7 +1275,11 @@ class WeixinClient:
                         # Stateful menu messages are ordered and never coalesced.
                         # Block later ordinary turns from overtaking this menu.
                         blocked_senders.add(sender)
-                        if sender in self._menu_tasks or len(self._menu_tasks) >= _MAX_MENU_TASKS:
+                        already_blocked = sender in local_blocked
+                        local_blocked.add(sender)
+                        if (already_blocked or sender in self._menu_tasks
+                                or sender in self._context_fast_tasks
+                                or len(self._menu_tasks) >= _MAX_MENU_TASKS):
                             continue
                         entry["menu_only"] = True
                         if await self._mark_running(entry):
@@ -1226,6 +1289,14 @@ class WeixinClient:
                     if entry.get("read_only") is True:
                         # A coalescible request must stay on the read-only route,
                         # even when idle; an arbitrary configured agent can act.
+                        contextual = entry.get("contextual") is True
+                        if contextual:
+                            blocked_senders.add(sender)
+                            already_blocked = sender in local_blocked
+                            local_blocked.add(sender)
+                            if (already_blocked or sender in self._menu_tasks
+                                    or sender in self._context_fast_tasks):
+                                continue
                         if len(self._fast_tasks) >= _MAX_FAST_TASKS:
                             continue
                         query = await self._try_recognize(message)
@@ -1233,9 +1304,12 @@ class WeixinClient:
                             _LOGGER.debug("Weixin dispatch route=local_fast pending=%d", len(self._pending))
                             task = asyncio.create_task(self._run_fast(sender, entry, query))
                             self._fast_tasks.add(task)
+                            if contextual:
+                                self._context_fast_tasks[sender] = task
                             task.add_done_callback(self._fast_done)
                         continue
                     if (sender not in blocked_senders and sender not in self._menu_tasks
+                            and sender not in self._context_fast_tasks
                             and sender not in self._normal_tasks
                             and len(self._normal_tasks) < _MAX_NORMAL_TASKS):
                         if await self._mark_running(entry):
@@ -1248,10 +1322,22 @@ class WeixinClient:
                         continue
                     query = await self._try_recognize(message)
                     if query is not None:
+                        contextual = self._query_text_key(message) is not None and self._context_agent() is not None
+                        if contextual:
+                            entry["read_only"] = True
+                            entry["contextual"] = True
+                            blocked_senders.add(sender)
+                            already_blocked = sender in local_blocked
+                            local_blocked.add(sender)
+                            if (already_blocked or sender in self._menu_tasks
+                                    or sender in self._context_fast_tasks):
+                                continue
                         if await self._mark_running(entry):
                             _LOGGER.debug("Weixin dispatch route=local_fast pending=%d", len(self._pending))
                             task = asyncio.create_task(self._run_fast(sender, entry, query))
                             self._fast_tasks.add(task)
+                            if contextual:
+                                self._context_fast_tasks[sender] = task
                             task.add_done_callback(self._fast_done)
                     else:
                         # A later normal turn must not leapfrog an earlier queued turn

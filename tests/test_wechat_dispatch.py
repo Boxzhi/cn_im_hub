@@ -22,7 +22,7 @@ original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and
 names = {"start", "stop", "_message_key", "_prune_seen", "_remember_context", "_enqueue_batch",
          "_verify_disk", "_persist_locked", "_async_save_state", "_accept_batch",
          "_mark_running", "_finish_entry", "_run_normal", "_fast_done", "_dispatch_pending",
-         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast", "_menu_agent", "_run_menu"}
+         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast", "_menu_agent", "_run_menu", "_context_agent"}
 methods = [node for node in original.body if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name in names]
 cls = ast.ClassDef(name="Dispatch", bases=[], keywords=[], body=methods, decorator_list=[])
 module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
@@ -76,6 +76,7 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
         d._normal_tasks = {}
         d._fast_tasks = set()
         d._menu_tasks = {}
+        d._context_fast_tasks = {}
         d._stopping = False
         d._task = None
         d._dispatch_task = None
@@ -115,6 +116,7 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
                 d._menu_tasks.pop(sender, None)
                 d._dispatch_event.set()
 
+        d._context_agent = lambda: None
         d._menu_agent = lambda message: None
         d._run_menu = menu
         d._handle_message = normal
@@ -238,6 +240,44 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
             await run(3, (agent, "nexora-entry", "help"))
             self.assertIn("菜单处理暂时失败", sent.await_args.kwargs["text"])
         self.assertEqual(self.started, [])
+
+    async def test_contextual_fast_and_followup_order_independent_of_ai(self):
+        d=self.d
+        d._context_agent=lambda: (object(),"nexora")
+        d._menu_agent=lambda m: True if m["text"] in {"上个月呢","费用呢","help"} else None
+        gate=asyncio.Event()
+        original=d._run_fast
+        async def fast(sender,entry,query):
+            if query=="fastwater" and not gate.is_set():
+                await gate.wait()
+            await original(sender,entry,query)
+        d._run_fast=fast
+        await self.enqueue(msg(1,"slow"),msg(2,"fastwater"),msg(3,"上个月呢"),
+                           msg(4,"费用呢"),msg(5,"fastwater"),msg(6,"help"))
+        await self.until(lambda: "a" in d._context_fast_tasks)
+        self.assertEqual(self.replies,[])
+        self.assertEqual(self.started,["slow"])
+        gate.set()
+        await self.until(lambda: len(self.replies)==5)
+        self.assertEqual(self.replies,["fastwater","上个月呢","费用呢","fastwater","help"])
+        self.release.set()
+        await self.until(lambda:not d._pending)
+
+    async def test_contextual_fast_waits_for_earlier_menu(self):
+        d=self.d
+        d._context_agent=lambda: (object(),"nexora")
+        d._menu_agent=lambda m: True if m["text"]=="help" else None
+        gate=asyncio.Event()
+        original=d._run_menu
+        async def menu(sender,entry):
+            await gate.wait()
+            await original(sender,entry)
+        d._run_menu=menu
+        await self.enqueue(msg(1,"help"),msg(2,"fastwater"))
+        await self.until(lambda:"a" in d._menu_tasks)
+        self.assertNotIn("a",d._context_fast_tasks)
+        gate.set()
+        await self.until(lambda:self.replies==["help","fastwater"])
 
     async def test_other_sender_not_blocked(self):
         await self.enqueue(msg(1, "slow"), msg(2, "normalB", "b"))

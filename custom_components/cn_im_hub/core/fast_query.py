@@ -74,7 +74,7 @@ async def recognize_fast_query(hass: HomeAssistant, text: str) -> FastQuery | No
         return None
 
 
-async def execute_fast_query(hass: HomeAssistant, query: FastQuery) -> str:
+async def execute_fast_query(hass: HomeAssistant, query: FastQuery, *, on_success=None) -> str:
     """Execute only the recognized handler, never retry via an action agent."""
     if _speech_handlers(hass).get(query.intent_type) is not query.handler:
         return "本地查询配置已变更，请重新发送。"
@@ -87,4 +87,9 @@ async def execute_fast_query(hass: HomeAssistant, query: FastQuery) -> str:
     speech = response.speech.get("plain", {}).get("speech")
     if response.response_type == intent.IntentResponseType.ERROR or not isinstance(speech, str) or not speech.strip():
         return "本地查询暂时无法返回有效结果，请稍后重试。"
+    if on_success is not None:
+        try:
+            on_success()
+        except Exception:
+            _LOGGER.debug("Fast query context observer failed", exc_info=True)
     return speech.strip()

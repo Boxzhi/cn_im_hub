@@ -66,6 +66,18 @@ class FastQueryTests(IsolatedAsyncioTestCase):
         self.assertEqual(await self.ns["execute_fast_query"](self.hass, query), "已关闭")
         self.execute.assert_awaited_once()
 
+    async def test_success_observer_only_for_valid_response(self):
+        observer=Mock()
+        query=await self.ns["recognize_fast_query"](self.hass,"灯亮着吗")
+        await self.ns["execute_fast_query"](self.hass,query,on_success=observer)
+        observer.assert_called_once()
+        self.execute.return_value.response_type="error"
+        await self.ns["execute_fast_query"](self.hass,query,on_success=observer)
+        observer.assert_called_once()
+        self.handlers.return_value={"Query":object()}
+        await self.ns["execute_fast_query"](self.hass,query,on_success=observer)
+        observer.assert_called_once()
+
     async def test_trigger_config_fails_closed(self):
         self.agent._trigger_intents_config["intents"]["trigger"] = {}
         self.assertIsNone(await self.ns["recognize_fast_query"](self.hass, "灯亮着吗"))
