@@ -27,7 +27,7 @@ methods = [node for node in original.body if isinstance(node, ast.AsyncFunctionD
 cls = ast.ClassDef(name="Dispatch", bases=[], keywords=[], body=methods, decorator_list=[])
 module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
 ns = dict(asyncio=asyncio, copy=copy, json=json, time=time, Any=Any, _LOGGER=logging.getLogger(__name__),
-          _DEDUP_TTL=86400, _MAX_SEEN=2048, _MAX_NORMAL_TASKS=2, _MAX_FAST_TASKS=2,
+          _DEDUP_TTL=86400, _MAX_SEEN=2048, _MAX_NORMAL_TASKS=2, _MAX_FAST_TASKS=2, _MAX_MENU_TASKS=2,
           _MESSAGE_TIMEOUT=180, _QUERY_TIMEOUT=5, _FAST_SEND_TIMEOUT=15,
           FastQuery=Any, PROVIDER_WECHAT="wechat")
 exec(compile(module, str(SOURCE), "exec"), ns)
@@ -75,6 +75,7 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
         d._dispatch_event = asyncio.Event()
         d._normal_tasks = {}
         d._fast_tasks = set()
+        d._menu_tasks = {}
         d._stopping = False
         d._task = None
         d._dispatch_task = None
@@ -106,6 +107,16 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
             entry["coalesce_closed"] = True
             await d._finish_entry(entry)
 
+        async def menu(sender, entry):
+            try:
+                self.replies.append(entry["msg"]["text"])
+                await d._finish_entry(entry)
+            finally:
+                d._menu_tasks.pop(sender, None)
+                d._dispatch_event.set()
+
+        d._menu_agent = lambda message: None
+        d._run_menu = menu
         d._handle_message = normal
         d._try_recognize = recognize
         d._run_fast = fast
@@ -132,6 +143,44 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
         self.release.set()
         await self.until(lambda: len(self.replies) == 4)
         self.assertEqual(self.replies, ["fast3", "slow", "normal2", "normal4"])
+
+    async def test_menu_overtakes_slow_and_repeated_digits_not_coalesced(self):
+        self.d._menu_agent = lambda m: True if m["text"] in {"help", "1", "exit"} else None
+        await self.enqueue(msg(1, "slow"), msg(2, "help"), msg(3, "1"),
+                           msg(4, "1"), msg(5, "exit"))
+        await self.until(lambda: self.replies == ["help", "1", "1", "exit"])
+        self.assertEqual(self.started, ["slow"])
+        self.release.set()
+        await self.until(lambda: not self.d._pending)
+
+    async def test_menu_lane_is_ordered_per_sender_and_independent(self):
+        d = self.d
+        d._menu_agent = lambda m: True if m["text"].startswith("menu") else None
+        gate = asyncio.Event()
+        original = d._run_menu
+        async def menu(sender, entry):
+            if entry["msg"]["text"] == "menu1":
+                await gate.wait()
+            await original(sender, entry)
+        d._run_menu = menu
+        await self.enqueue(msg(1, "menu1"), msg(2, "menu2"), msg(3, "menuB", "b"))
+        try:
+            await self.until(lambda: self.replies == ["menuB"])
+            self.assertIn("a", d._menu_tasks)
+            self.assertNotIn("menu2", self.replies)
+        finally:
+            gate.set()
+        await self.until(lambda: len(self.replies) == 3)
+        self.assertEqual(self.replies, ["menuB", "menu1", "menu2"])
+
+    async def test_persisted_menu_never_enters_normal_lane_after_agent_loss(self):
+        d = self.d
+        await d.stop()
+        d._store.data = {"pending": [{"state": "queued", "menu_only": True,
+                                      "msg": msg(1, "help")}]}
+        await d.start()
+        await self.until(lambda: self.replies == ["help"] and not d._pending)
+        self.assertEqual(self.started, [])
 
     async def test_other_sender_not_blocked(self):
         await self.enqueue(msg(1, "slow"), msg(2, "normalB", "b"))

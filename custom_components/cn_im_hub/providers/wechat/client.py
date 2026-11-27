@@ -11,7 +11,8 @@ import time
 from typing import Any
 
 import voluptuous as vol
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import Context, HomeAssistant, callback
+from homeassistant.components import conversation
 from homeassistant.helpers.storage import Store
 
 EVENT_LIVE_PROGRESS = "ha_crack_live_progress"
@@ -33,6 +34,7 @@ from ...const import (
     WECHAT_DEFAULT_BASE_URL,
 )
 from ...core.known_targets import async_get_tracker
+from ...core.conversation import _normalize_agent_id_for_runtime, extract_speech_any
 from ...core.fast_query import FastQuery, recognize_fast_query, execute_fast_query
 from ...models import ProviderRuntime
 from ...media.rich_media import (
@@ -71,6 +73,8 @@ _STORE_VERSION = 1
 _MAX_PENDING = 100
 _MAX_NORMAL_TASKS = 2
 _MAX_FAST_TASKS = 2
+_MAX_MENU_TASKS = 2
+_MENU_TIMEOUT = 10
 _FAST_SEND_TIMEOUT = 15
 _MESSAGE_TIMEOUT = 180
 _DEDUP_TTL = 86400
@@ -236,6 +240,7 @@ class WeixinClient:
         self._dispatch_task: asyncio.Task[None] | None = None
         self._normal_tasks: dict[str, asyncio.Task[None]] = {}
         self._fast_tasks: set[asyncio.Task[None]] = set()
+        self._menu_tasks: dict[str, asyncio.Task[None]] = {}
         self._pause_until = 0.0
         self._tracker = None
         self._typing_tickets: dict[str, tuple[str, float]] = {}
@@ -275,7 +280,9 @@ class WeixinClient:
                     )
                     continue
                 recovered = {"state": "queued", "msg": entry["msg"]}
-                if entry.get("read_only") is True:
+                if entry.get("menu_only") is True:
+                    recovered["menu_only"] = True
+                elif entry.get("read_only") is True:
                     recovered["read_only"] = True
                 self._pending.append(recovered)
                 # Stored context_tokens already contains the newest token.
@@ -291,7 +298,8 @@ class WeixinClient:
     async def stop(self) -> None:
         self._stopping = True
         tasks = [task for task in (self._task, self._dispatch_task,
-                                  *self._normal_tasks.values(), *self._fast_tasks)
+                                  *self._normal_tasks.values(), *self._fast_tasks,
+                                  *self._menu_tasks.values())
                  if task is not None]
         for task in tasks:
             task.cancel()
@@ -304,6 +312,7 @@ class WeixinClient:
         self._dispatch_task = None
         self._normal_tasks.clear()
         self._fast_tasks.clear()
+        self._menu_tasks.clear()
         _LOGGER.debug("Weixin dispatcher stopped active_tasks=0")
         self._status = "disconnected"
         await self._notify_stop()
@@ -892,6 +901,8 @@ class WeixinClient:
             if protocol_key is not None and protocol_key in self._seen:
                 continue
             checked.add(key)
+            if self._menu_agent(message) is not None:
+                continue
             if await self._try_recognize(message) is not None:
                 eligible.add(key)
         return eligible
@@ -919,11 +930,14 @@ class WeixinClient:
                 self._seen[key] = time.time()
                 pending_keys.add(key)
             query_key = self._query_text_key(message)
-            if query_key is not None and query_key in open_queries:
+            menu_only = self._menu_agent(message) is not None
+            if not menu_only and query_key is not None and query_key in open_queries:
                 _LOGGER.debug("Weixin pending read-only query coalesced")
                 continue
             entry = {"state": "queued", "msg": message}
-            if query_key is not None and query_key in eligible:
+            if menu_only:
+                entry["menu_only"] = True
+            elif query_key is not None and query_key in eligible:
                 entry["read_only"] = True
                 open_queries.add(query_key)
             self._pending.append(entry)
@@ -1110,6 +1124,78 @@ class WeixinClient:
             _LOGGER.error("Weixin fast worker failed: %s", type(task.exception()).__name__)
         self._dispatch_event.set()
 
+    def _menu_agent(self, message: dict[str, Any]):
+        """Opt in only when the selected agent advertises the local menu protocol."""
+        key = self._query_text_key(message)
+        if key is None:
+            return None
+        try:
+            aid = _normalize_agent_id_for_runtime(
+                self._hass, str(self._conversation_agent_id or "").strip()
+            )
+            if not aid:
+                return None
+            agent = conversation.async_get_agent(self._hass, aid)
+            if (getattr(agent, "menu_protocol_version", None) != 1
+                    or not callable(getattr(agent, "async_process_menu", None))
+                    or not callable(getattr(agent, "is_menu_message", None))):
+                return None
+            if agent.is_menu_message(key[1]) is True:
+                return agent, aid, key[1]
+        except Exception:
+            _LOGGER.debug("Weixin menu protocol unavailable", exc_info=True)
+        return None
+
+    async def _run_menu(self, sender: str, entry: dict[str, Any]) -> None:
+        """Ordered stateful menu worker; never retry through the ordinary agent."""
+        started = time.monotonic()
+        try:
+            token = str(entry["msg"].get("context_token") or "").strip() or self._context_tokens.get(sender)
+            if not sender or not token:
+                return
+            if self._tracker is not None:
+                await asyncio.wait_for(
+                    self._tracker.async_record(provider=PROVIDER_WECHAT, target=sender,
+                                               target_type="user_id", display_name=sender),
+                    timeout=_FAST_SEND_TIMEOUT,
+                )
+            try:
+                selected = self._menu_agent(entry["msg"])
+                if selected is None:
+                    reply = "菜单配置已变更，请重新发送 help。"
+                else:
+                    agent, aid, text = selected
+                    user_input = conversation.ConversationInput(
+                        text=text, context=Context(),
+                        conversation_id=f"wechat:{self._account_id}:{sender}",
+                        device_id=None, satellite_id=None,
+                        language=self._hass.config.language, agent_id=aid,
+                    )
+                    result = await asyncio.wait_for(
+                        agent.async_process_menu(user_input), timeout=_MENU_TIMEOUT
+                    )
+                    reply = extract_speech_any(result) or "菜单未返回有效回复，请发送 help。"
+            except Exception:
+                _LOGGER.exception("Weixin local menu failed")
+                reply = "菜单处理暂时失败，请发送 help。"
+            await asyncio.wait_for(
+                async_send_weixin_text(
+                    self._hass, base_url=self._base_url, token=self._token,
+                    to_user_id=sender, context_token=token, text=reply,
+                ), timeout=_FAST_SEND_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Weixin menu reply failed; not replaying")
+        finally:
+            try:
+                await self._finish_entry(entry)
+            finally:
+                self._menu_tasks.pop(sender, None)
+                self._dispatch_event.set()
+                _LOGGER.debug("Weixin local_menu completed elapsed_ms=%d", (time.monotonic() - started) * 1000)
+
     async def _dispatch_pending(self) -> None:
         """Keep each conversational lane ordered; bypass it only for read-only scripts."""
         while not self._stopping:
@@ -1124,6 +1210,19 @@ class WeixinClient:
                         continue
                     message = entry["msg"]
                     sender = str(message.get("from_user_id") or "").strip()
+                    if entry.get("menu_only") is True or (
+                        entry.get("read_only") is not True and self._menu_agent(message) is not None
+                    ):
+                        # Stateful menu messages are ordered and never coalesced.
+                        # Block later ordinary turns from overtaking this menu.
+                        blocked_senders.add(sender)
+                        if sender in self._menu_tasks or len(self._menu_tasks) >= _MAX_MENU_TASKS:
+                            continue
+                        entry["menu_only"] = True
+                        if await self._mark_running(entry):
+                            _LOGGER.debug("Weixin dispatch route=local_menu pending=%d", len(self._pending))
+                            self._menu_tasks[sender] = asyncio.create_task(self._run_menu(sender, entry))
+                        continue
                     if entry.get("read_only") is True:
                         # A coalescible request must stay on the read-only route,
                         # even when idle; an arbitrary configured agent can act.
@@ -1136,7 +1235,8 @@ class WeixinClient:
                             self._fast_tasks.add(task)
                             task.add_done_callback(self._fast_done)
                         continue
-                    if (sender not in blocked_senders and sender not in self._normal_tasks
+                    if (sender not in blocked_senders and sender not in self._menu_tasks
+                            and sender not in self._normal_tasks
                             and len(self._normal_tasks) < _MAX_NORMAL_TASKS):
                         if await self._mark_running(entry):
                             _LOGGER.debug("Weixin dispatch route=normal pending=%d", len(self._pending))
