@@ -22,7 +22,7 @@ original = next(node for node in tree.body if isinstance(node, ast.ClassDef) and
 names = {"start", "stop", "_message_key", "_prune_seen", "_remember_context", "_enqueue_batch",
          "_verify_disk", "_persist_locked", "_async_save_state", "_accept_batch",
          "_mark_running", "_finish_entry", "_run_normal", "_fast_done", "_dispatch_pending",
-         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast"}
+         "_query_text_key", "_open_query_keys", "_classify_batch", "_run_fast", "_menu_agent", "_run_menu"}
 methods = [node for node in original.body if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name in names]
 cls = ast.ClassDef(name="Dispatch", bases=[], keywords=[], body=methods, decorator_list=[])
 module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
@@ -180,6 +180,63 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
                                       "msg": msg(1, "help")}]}
         await d.start()
         await self.until(lambda: self.replies == ["help"] and not d._pending)
+        self.assertEqual(self.started, [])
+
+    async def test_real_menu_protocol_requires_selected_agent_and_plain_text(self):
+        from unittest.mock import patch
+        d = self.d
+        d._conversation_agent_id = "nexora-entry"
+        agent = SimpleNamespace(menu_protocol_version=1,
+                                is_menu_message=lambda text: text == "help",
+                                async_process_menu=lambda u: None)
+        with patch.dict(ns, {
+            "_normalize_agent_id_for_runtime": lambda hass, aid: aid,
+            "conversation": SimpleNamespace(async_get_agent=lambda hass, aid: agent),
+        }):
+            self.assertEqual(Dispatch._menu_agent(d, msg(1, "help")), (agent, "nexora-entry", "help"))
+            self.assertIsNone(Dispatch._menu_agent(d, msg(2, "ordinary")))
+            quoted = msg(3, "help")
+            quoted["item_list"][0]["ref_msg"] = {}
+            self.assertIsNone(Dispatch._menu_agent(d, quoted))
+            agent.menu_protocol_version = 2
+            self.assertIsNone(Dispatch._menu_agent(d, msg(4, "help")))
+
+    async def test_real_menu_worker_preserves_session_and_never_falls_back(self):
+        from unittest.mock import AsyncMock, patch
+        d = self.d
+        d._tracker = None
+        d._base_url, d._token = "test", "test"
+        d._hass.config = SimpleNamespace(language="zh-CN")
+        processor = AsyncMock(return_value="本地菜单")
+        agent = SimpleNamespace(async_process_menu=processor)
+        sender = "a"
+        sent = AsyncMock()
+        async def run(i, selected):
+            d._menu_agent = lambda message: selected
+            entry = {"state": "running", "menu_only": True, "msg": msg(i, "help", sender)}
+            d._pending.append(entry)
+            await Dispatch._run_menu(d, sender, entry)
+            self.assertNotIn(entry, d._pending)
+        with patch.dict(ns, {
+            "conversation": SimpleNamespace(ConversationInput=lambda **kw: SimpleNamespace(**kw)),
+            "Context": lambda: SimpleNamespace(user_id=None),
+            "extract_speech_any": lambda result: result,
+            "async_send_weixin_text": sent,
+            "_MENU_TIMEOUT": 10,
+        }):
+            await run(1, (agent, "nexora-entry", "help"))
+            u = processor.await_args.args[0]
+            self.assertEqual(u.conversation_id, "wechat:test:a")
+            self.assertEqual(u.text, "help")
+            self.assertEqual(u.agent_id, "nexora-entry")
+            self.assertEqual(sent.await_args.kwargs["text"], "本地菜单")
+            self.assertEqual(sent.await_args.kwargs["context_token"], "1")
+            await run(2, None)
+            self.assertIn("配置已变更", sent.await_args.kwargs["text"])
+            processor.assert_awaited_once()
+            processor.side_effect = RuntimeError("test")
+            await run(3, (agent, "nexora-entry", "help"))
+            self.assertIn("菜单处理暂时失败", sent.await_args.kwargs["text"])
         self.assertEqual(self.started, [])
 
     async def test_other_sender_not_blocked(self):
