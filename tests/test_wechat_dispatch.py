@@ -263,6 +263,42 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
         self.release.set()
         await self.until(lambda:not d._pending)
 
+    async def test_real_fast_worker_captures_slots_only_for_current_agent(self):
+        from unittest.mock import AsyncMock, Mock, patch
+        d=self.d
+        d._tracker=None
+        d._base_url,d._token="test","test"
+        ticket=object()
+        agent=SimpleNamespace(begin_fast_context=Mock(return_value=ticket),
+                              finish_fast_context=Mock())
+        selected=(agent,"nexora")
+        d._context_agent=lambda:selected
+        sent=AsyncMock()
+        query=SimpleNamespace(intent_type="LuxeUtilityQuery",
+                              slots={"utility_kind":{"value":"w","text":"水"}})
+        async def execute(hass,q,*,on_success=None):
+            on_success()
+            return "真实数据"
+        async def run(i):
+            entry={"state":"running","read_only":True,"contextual":True,"msg":msg(i,"fastwater")}
+            d._pending.append(entry)
+            await Dispatch._run_fast(d,"a",entry,query)
+            self.assertNotIn(entry,d._pending)
+        with patch.dict(ns,{"execute_fast_query":execute,"async_send_weixin_text":sent}):
+            await run(1)
+            agent.begin_fast_context.assert_called_once_with("wechat:test:a")
+            agent.finish_fast_context.assert_called_once_with(
+                "wechat:test:a",ticket,"LuxeUtilityQuery",{"utility_kind":"w"})
+            self.assertEqual(sent.await_args.kwargs["text"],"真实数据")
+            async def replaced(hass,q,*,on_success=None):
+                nonlocal selected
+                selected=(object(),"nexora")
+                on_success()
+                return "真实数据"
+            with patch.dict(ns,{"execute_fast_query":replaced}):
+                await run(2)
+            agent.finish_fast_context.assert_called_once()
+
     async def test_contextual_fast_waits_for_earlier_menu(self):
         d=self.d
         d._context_agent=lambda: (object(),"nexora")
