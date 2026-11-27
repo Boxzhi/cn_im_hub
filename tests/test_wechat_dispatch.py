@@ -402,6 +402,44 @@ class DispatchTest(unittest.IsolatedAsyncioTestCase):
             processor.assert_awaited_once()
         self.assertEqual(self.started,[])
 
+    async def test_recovered_old_queue_reclassifies_local_semantics_and_native(self):
+        d=self.d
+        await d.stop()
+        d._context_agent=lambda:(object(),"nexora")
+        d._semantic_agent=lambda m:True if m["text"] in {"fastlux","阳台光照度"} else None
+        d._guard_agent=lambda m:True if m["text"]=="阳台传感器坏了吗" else None
+        d._store.data={"pending":[{"state":"queued","msg":msg(1,"slow")},
+                                   {"state":"queued","msg":msg(2,"fastlux")},
+                                   {"state":"queued","msg":msg(3,"阳台光照度")},
+                                   {"state":"queued","msg":msg(4,"阳台传感器坏了吗")}]}
+        await d.start()
+        await self.until(lambda:len(self.replies)==3)
+        self.assertEqual(self.replies,["fastlux","阳台光照度","阳台传感器坏了吗"])
+        self.assertEqual(self.started,["slow"])
+        self.release.set()
+        await self.until(lambda:not d._pending)
+
+    async def test_recovered_legacy_fast_query_orders_before_menu_followup(self):
+        d=self.d
+        await d.stop()
+        d._context_agent=lambda:(object(),"nexora")
+        d._menu_agent=lambda m:True if m["text"]=="上个月呢" else None
+        gate=asyncio.Event()
+        original=d._run_fast
+        async def fast(sender,entry,query):
+            await gate.wait()
+            await original(sender,entry,query)
+        d._run_fast=fast
+        d._store.data={"pending":[{"state":"queued","read_only":True,"msg":msg(1,"fastwater")},
+                                   {"state":"queued","msg":msg(2,"上个月呢")}]}
+        await d.start()
+        try:
+            await self.until(lambda:"a" in d._context_fast_tasks)
+            self.assertFalse(self.replies)
+        finally:
+            gate.set()
+        await self.until(lambda:self.replies==["fastwater","上个月呢"])
+
     async def test_other_sender_not_blocked(self):
         await self.enqueue(msg(1, "slow"), msg(2, "normalB", "b"))
         await self.until(lambda: "normalB" in self.replies)

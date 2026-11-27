@@ -1326,6 +1326,26 @@ class WeixinClient:
                         continue
                     message = entry["msg"]
                     sender = str(message.get("from_user_id") or "").strip()
+                    # Entries restored from an older version may lack the negotiated
+                    # lane flags. Reclassify plain messages before starting a worker.
+                    plain = self._query_text_key(message) is not None
+                    contextual_agent = self._context_agent() if plain else None
+                    if entry.get("read_only") is True and contextual_agent is not None:
+                        entry["contextual"] = True
+                    if (plain and entry.get("read_only") is not True
+                            and entry.get("menu_only") is not True
+                            and self._menu_agent(message) is None):
+                        semantic = self._semantic_agent(message) is not None
+                        guarded = not semantic and self._guard_agent(message) is not None
+                        if semantic or guarded:
+                            # Preserve strict-native priority after reload/upgrade.
+                            if await self._try_recognize(message) is not None:
+                                entry["read_only"] = True
+                                if contextual_agent is not None:
+                                    entry["contextual"] = True
+                            else:
+                                entry["menu_only"] = True
+                                entry["semantic_only" if semantic else "guarded_only"] = True
                     if entry.get("menu_only") is True or (
                         entry.get("read_only") is not True and self._menu_agent(message) is not None
                     ):
